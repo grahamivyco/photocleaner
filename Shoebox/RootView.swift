@@ -166,12 +166,19 @@ struct AccessBadge: View {
 
 /// Shown wherever the library drive is missing.
 struct DriveBanner: View {
+    @Environment(PhotoLibrary.self) private var library
+
     var body: some View {
         HStack(spacing: 10) {
             Image(systemName: "externaldrive.badge.xmark")
-            Text("Photos drive not connected. Plug it in to continue.")
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Photos drive not connected. Plug it in to continue.")
+                Text(Config.libraryPath).foregroundStyle(Theme.muted).lineLimit(1).truncationMode(.middle)
+            }
             Spacer()
-            Text(Config.libraryPath).foregroundStyle(Theme.muted).lineLimit(1).truncationMode(.middle)
+            Button("My library is somewhere else now") { library.requireDrive = false }
+                .buttonStyle(PillButtonStyle())
+                .help("Use whatever library Photos has set as its System Photo Library")
         }
         .font(Theme.label(13))
         .foregroundStyle(Theme.ink)
