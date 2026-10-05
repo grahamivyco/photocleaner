@@ -95,7 +95,7 @@ final class ReviewSession {
     /// Sum of every stored resource (original, Live Photo video, edits).
     nonisolated static func fileSize(of asset: PHAsset) -> Int64 {
         PHAssetResource.assetResources(for: asset).reduce(Int64(0)) { total, resource in
-            guard resource.responds(to: Selector(("fileSize"))),
+            guard resource.responds(to: NSSelectorFromString("fileSize")),
                   let n = resource.value(forKey: "fileSize") as? NSNumber else { return total }
             return total + n.int64Value
         }

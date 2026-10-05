@@ -23,7 +23,10 @@ enum Theme {
 
 enum Format {
     static func bytes(_ n: Int64) -> String {
-        ByteCountFormatter.string(fromByteCount: n, countStyle: .file)
+        let f = ByteCountFormatter()
+        f.countStyle = .file
+        f.allowsNonnumericFormatting = false
+        return f.string(fromByteCount: n)
     }
 
     static func duration(_ seconds: TimeInterval) -> String {
