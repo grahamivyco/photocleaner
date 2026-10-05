@@ -22,6 +22,20 @@ struct MonthKey: Hashable, Codable, Comparable, Identifiable {
     }
 
     var title: String { "\(monthName) \(year)" }
+
+    init(year: Int, month: Int) {
+        self.year = year
+        self.month = month
+    }
+
+    init(_ date: Date) {
+        let c = Calendar.current.dateComponents([.year, .month], from: date)
+        self.init(year: c.year ?? 1970, month: c.month ?? 1)
+    }
+
+    var previous: MonthKey {
+        month == 1 ? MonthKey(year: year - 1, month: 12) : MonthKey(year: year, month: month - 1)
+    }
 }
 
 struct MonthSummary: Identifiable {
@@ -42,19 +56,47 @@ enum MediaFilter {
                     NSNumber(value: PHAssetMediaType.video.rawValue))
     }
 
-    static func fetchAssets(in month: MonthKey) -> [PHAsset] {
+    static func options(for month: MonthKey, videosOnly: Bool = false, sorted: Bool = true) -> PHFetchOptions {
         let opts = PHFetchOptions()
         opts.predicate = NSCompoundPredicate(andPredicateWithSubpredicates: [
-            mediaPredicate,
+            videosOnly
+                ? NSPredicate(format: "mediaType == %@", NSNumber(value: PHAssetMediaType.video.rawValue))
+                : mediaPredicate,
             NSPredicate(format: "creationDate >= %@ AND creationDate < %@",
                         month.startDate as NSDate, month.endDate as NSDate),
         ])
-        opts.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: true)]
-        let result = PHAsset.fetchAssets(with: opts)
+        if sorted { opts.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: true)] }
+        return opts
+    }
+
+    static func fetchAssets(in month: MonthKey) -> [PHAsset] {
+        let result = PHAsset.fetchAssets(with: options(for: month))
         var assets: [PHAsset] = []
         assets.reserveCapacity(result.count)
         for i in 0..<result.count { assets.append(result.object(at: i)) }
         return assets
+    }
+
+    /// Counts for one month using database counts, without loading every item.
+    static func summary(for month: MonthKey) -> MonthSummary? {
+        let all = PHAsset.fetchAssets(with: options(for: month))
+        guard all.count > 0 else { return nil }
+        let videos = PHAsset.fetchAssets(with: options(for: month, videosOnly: true, sorted: false)).count
+        return MonthSummary(key: month, photos: all.count - videos, videos: videos,
+                            coverID: all.firstObject?.localIdentifier)
+    }
+
+    /// Oldest and newest dated items in the library.
+    static func dateRange() -> (oldest: Date, newest: Date)? {
+        func edge(ascending: Bool) -> Date? {
+            let opts = PHFetchOptions()
+            opts.predicate = mediaPredicate
+            opts.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: ascending)]
+            opts.fetchLimit = 1
+            return PHAsset.fetchAssets(with: opts).firstObject?.creationDate
+        }
+        guard let oldest = edge(ascending: true), let newest = edge(ascending: false) else { return nil }
+        return (oldest, newest)
     }
 }
 
@@ -66,6 +108,7 @@ final class PhotoLibrary {
     var driveConnected = false
     var months: [MonthSummary] = []
     var isIndexing = false
+    var indexingMonth: MonthKey?
     private var observers: [NSObjectProtocol] = []
 
     init() {
@@ -94,32 +137,32 @@ final class PhotoLibrary {
         if access == .granted { await buildIndex() }
     }
 
-    /// Counts items per calendar month. Reads metadata only, never touches files.
+    /// Counts items month by month, newest first. Reads metadata only, never touches files.
     func buildIndex() async {
         guard access == .granted, driveConnected, !isIndexing else { return }
         isIndexing = true
-        let result = await Task.detached(priority: .userInitiated) { () -> [MonthSummary] in
-            let opts = PHFetchOptions()
-            opts.predicate = MediaFilter.mediaPredicate
-            opts.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: true)]
-            let assets = PHAsset.fetchAssets(with: opts)
-            let cal = Calendar.current
-            var buckets: [MonthKey: MonthSummary] = [:]
-            for i in 0..<assets.count {
-                let asset = assets.object(at: i)
-                guard let date = asset.creationDate else { continue }
-                let c = cal.dateComponents([.year, .month], from: date)
-                guard let y = c.year, let m = c.month else { continue }
-                let key = MonthKey(year: y, month: m)
-                var s = buckets[key] ?? MonthSummary(key: key, photos: 0, videos: 0)
-                if asset.mediaType == .video { s.videos += 1 } else { s.photos += 1 }
-                if s.coverID == nil { s.coverID = asset.localIdentifier }
-                buckets[key] = s
+        defer {
+            isIndexing = false
+            indexingMonth = nil
+        }
+        guard let range = await Task.detached(priority: .userInitiated, operation: { MediaFilter.dateRange() }).value else {
+            months = []
+            return
+        }
+        let firstBuild = months.isEmpty
+        let oldest = MonthKey(range.oldest)
+        var key = MonthKey(range.newest)
+        var found: [MonthSummary] = []
+        while key >= oldest {
+            indexingMonth = key
+            let month = key
+            if let s = await Task.detached(priority: .userInitiated, operation: { MediaFilter.summary(for: month) }).value {
+                found.append(s)
+                if firstBuild { months = found }
             }
-            return buckets.values.sorted { $0.key > $1.key }
-        }.value
-        months = result
-        isIndexing = false
+            key = key.previous
+        }
+        months = found
     }
 
     private static func map(_ s: PHAuthorizationStatus) -> Access {
