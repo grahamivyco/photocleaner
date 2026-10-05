@@ -79,11 +79,18 @@ enum MediaFilter {
 
     /// Counts for one month using database counts, without loading every item.
     static func summary(for month: MonthKey) -> MonthSummary? {
-        let all = PHAsset.fetchAssets(with: options(for: month))
-        guard all.count > 0 else { return nil }
+        // Unsorted counts are the cheapest questions Photos can answer.
+        let total = PHAsset.fetchAssets(with: options(for: month, sorted: false)).count
+        guard total > 0 else { return nil }
         let videos = PHAsset.fetchAssets(with: options(for: month, videosOnly: true, sorted: false)).count
-        return MonthSummary(key: month, photos: all.count - videos, videos: videos,
-                            coverID: all.firstObject?.localIdentifier)
+        return MonthSummary(key: month, photos: total - videos, videos: videos, coverID: nil)
+    }
+
+    /// The newest item in a month, for the tile picture. Asked for after the count.
+    static func coverID(for month: MonthKey) -> String? {
+        let opts = options(for: month)
+        opts.fetchLimit = 1
+        return PHAsset.fetchAssets(with: opts).firstObject?.localIdentifier
     }
 }
 
@@ -180,16 +187,17 @@ final class PhotoLibrary {
 
     /// Asks for a month's count. Called when its tile appears; newest requests go first.
     func requestSummary(_ key: MonthKey) {
-        guard summaries[key] == nil, !emptyMonths.contains(key) else { return }
-        queue.removeAll { $0 == key }
-        queue.insert(key, at: 0)
+        guard summaries[key] == nil, !emptyMonths.contains(key), !queue.contains(key) else { return }
+        queue.append(key)
         pump()
     }
 
-    func isCounting(_ key: MonthKey) -> Bool {
-        if case .working = phase { return queue.first == key }
-        return false
-    }
+    /// The month being counted right now.
+    private(set) var countingKey: MonthKey?
+
+    func isCounting(_ key: MonthKey) -> Bool { countingKey == key }
+
+    func isCounted(_ key: MonthKey) -> Bool { summaries[key] != nil || emptyMonths.contains(key) }
 
     /// Forget a month's count so it's recounted (after deleting from it).
     func invalidate(_ key: MonthKey) {
@@ -208,14 +216,27 @@ final class PhotoLibrary {
     /// One Photos lookup at a time, newest request first. No time limit:
     /// a busy Photos just takes longer, and the status line shows how long.
     private func runQueue() async {
-        while let key = queue.first {
-            guard canQuery else { return }
-            begin(.working("Counting \(key.title)"))
-            let result = await Task.detached(priority: .userInitiated) { MediaFilter.summary(for: key) }.value
-            NSLog("Shoebox: counted %@ in %.1fs", key.id, Date().timeIntervalSince(phaseStarted))
-            queue.removeAll { $0 == key }
-            if let s = result { summaries[key] = s } else { emptyMonths.insert(key) }
-        }
+        defer { countingKey = nil }
+        repeat {
+            // Always the newest waiting month next, so the current month comes first.
+            while let key = queue.max() {
+                guard canQuery else { return }
+                countingKey = key
+                begin(.working("Counting \(key.title)"))
+                let result = await Task.detached(priority: .userInitiated) { MediaFilter.summary(for: key) }.value
+                NSLog("Shoebox: counted %@ in %.1fs", key.id, Date().timeIntervalSince(phaseStarted))
+                queue.removeAll { $0 == key }
+                if let s = result { summaries[key] = s } else { emptyMonths.insert(key) }
+            }
+            countingKey = nil
+            // Tile pictures last, and only while no month is waiting to be counted.
+            for key in summaries.keys.sorted(by: >) where summaries[key]?.coverID == nil {
+                guard canQuery, queue.isEmpty else { break }
+                begin(.working("Loading pictures"))
+                let id = await Task.detached(priority: .utility) { MediaFilter.coverID(for: key) }.value
+                summaries[key]?.coverID = id
+            }
+        } while canQuery && !queue.isEmpty
         phase = .ready
     }
 
