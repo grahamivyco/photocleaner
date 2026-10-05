@@ -111,6 +111,8 @@ final class PhotoLibrary {
     var oldest: MonthKey?
     var newest: MonthKey?
     var isIndexing = false
+    /// Set when Photos takes unusually long to answer the first lookup.
+    var isSlow = false
     /// Counts are loaded one month at a time, only for months on screen.
     var summaries: [MonthKey: MonthSummary] = [:]
     var emptyMonths: Set<MonthKey> = []
@@ -147,7 +149,19 @@ final class PhotoLibrary {
     func loadRange() async {
         guard access == .granted, driveConnected, !isIndexing else { return }
         isIndexing = true
-        defer { isIndexing = false }
+        isSlow = false
+        let started = Date()
+        NSLog("Shoebox: asking Photos for date range")
+        let watchdog = Task {
+            try? await Task.sleep(for: .seconds(15))
+            if !Task.isCancelled { isSlow = true }
+        }
+        defer {
+            watchdog.cancel()
+            isIndexing = false
+            isSlow = false
+            NSLog("Shoebox: date range took %.1fs", Date().timeIntervalSince(started))
+        }
         guard let range = await Task.detached(priority: .userInitiated, operation: { MediaFilter.dateRange() }).value else {
             years = []
             return

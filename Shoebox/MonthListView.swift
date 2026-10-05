@@ -18,9 +18,18 @@ struct MonthListView: View {
                 header
                 if !library.driveConnected { DriveBanner() }
                 if library.isIndexing && library.years.isEmpty {
-                    HStack(spacing: 10) {
-                        ProgressView().controlSize(.small)
-                        Text("Opening your library…").foregroundStyle(Theme.muted)
+                    VStack(spacing: 12) {
+                        HStack(spacing: 10) {
+                            ProgressView().controlSize(.small)
+                            Text("Opening your library…").foregroundStyle(Theme.muted)
+                        }
+                        if library.isSlow {
+                            Text("Photos is taking a while to answer. Open the Photos app and check it shows your library without any messages. Shoebox will carry on when Photos is ready.")
+                                .font(.system(size: 13))
+                                .foregroundStyle(Theme.muted)
+                                .multilineTextAlignment(.center)
+                                .frame(maxWidth: 460)
+                        }
                     }
                     .padding(.top, 40)
                     .frame(maxWidth: .infinity)
