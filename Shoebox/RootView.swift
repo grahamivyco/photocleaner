@@ -5,6 +5,7 @@ struct RootView: View {
     @Environment(PhotoLibrary.self) private var library
     @Environment(ProgressStore.self) private var store
     @State private var session: ReviewSession?
+    @State private var opening: MonthKey?
 
     var body: some View {
         ZStack {
@@ -21,15 +22,45 @@ struct RootView: View {
                     .transition(.opacity)
                 } else {
                     MonthListView { key in
-                        withAnimation(.easeOut(duration: 0.2)) {
-                            session = ReviewSession(month: key, store: store)
+                        guard opening == nil else { return }
+                        opening = key
+                        Task {
+                            let s = await ReviewSession.open(month: key, store: store)
+                            guard opening == key else { return }
+                            withAnimation(.easeOut(duration: 0.2)) {
+                                session = s
+                                opening = nil
+                            }
                         }
                     }
                     .transition(.opacity)
+                    .overlay {
+                        if let opening {
+                            OpeningOverlay(month: opening) { self.opening = nil }
+                        }
+                    }
                 }
             }
         }
         .task { library.start() }
+    }
+}
+
+private struct OpeningOverlay: View {
+    let month: MonthKey
+    let onCancel: () -> Void
+
+    var body: some View {
+        ZStack {
+            Theme.bg.opacity(0.75).ignoresSafeArea()
+            VStack(spacing: 14) {
+                ProgressView()
+                Text("Opening \(month.title)…").font(Theme.display(20)).foregroundStyle(Theme.ink)
+                Button("Cancel", action: onCancel).buttonStyle(PillButtonStyle())
+            }
+            .padding(28)
+            .background(RoundedRectangle(cornerRadius: 14).fill(Theme.surface))
+        }
     }
 }
 
