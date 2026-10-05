@@ -106,9 +106,15 @@ final class PhotoLibrary {
 
     var access: Access = .unknown
     var driveConnected = false
-    var months: [MonthSummary] = []
+    /// Years that contain items, newest first. Found with two quick lookups.
+    var years: [Int] = []
+    var oldest: MonthKey?
+    var newest: MonthKey?
     var isIndexing = false
-    var indexingMonth: MonthKey?
+    /// Counts are loaded one month at a time, only for months on screen.
+    var summaries: [MonthKey: MonthSummary] = [:]
+    var emptyMonths: Set<MonthKey> = []
+    private var loading: Set<MonthKey> = []
     private var observers: [NSObjectProtocol] = []
 
     init() {
@@ -126,43 +132,55 @@ final class PhotoLibrary {
         let connected = FileManager.default.fileExists(atPath: Config.libraryPath)
         let wasConnected = driveConnected
         driveConnected = connected
-        if connected && !wasConnected && access == .granted && months.isEmpty {
-            Task { await buildIndex() }
+        if connected && !wasConnected && access == .granted && years.isEmpty {
+            Task { await loadRange() }
         }
     }
 
     func requestAccess() async {
         let status = await PHPhotoLibrary.requestAuthorization(for: .readWrite)
         access = Self.map(status)
-        if access == .granted { await buildIndex() }
+        if access == .granted { await loadRange() }
     }
 
-    /// Counts items month by month, newest first. Reads metadata only, never touches files.
-    func buildIndex() async {
+    /// Finds the oldest and newest items so the year picker knows its range.
+    func loadRange() async {
         guard access == .granted, driveConnected, !isIndexing else { return }
         isIndexing = true
-        defer {
-            isIndexing = false
-            indexingMonth = nil
-        }
+        defer { isIndexing = false }
         guard let range = await Task.detached(priority: .userInitiated, operation: { MediaFilter.dateRange() }).value else {
-            months = []
+            years = []
             return
         }
-        let firstBuild = months.isEmpty
-        let oldest = MonthKey(range.oldest)
-        var key = MonthKey(range.newest)
-        var found: [MonthSummary] = []
-        while key >= oldest {
-            indexingMonth = key
-            let month = key
-            if let s = await Task.detached(priority: .userInitiated, operation: { MediaFilter.summary(for: month) }).value {
-                found.append(s)
-                if firstBuild { months = found }
-            }
-            key = key.previous
+        let first = MonthKey(range.oldest)
+        let last = MonthKey(range.newest)
+        oldest = first
+        newest = last
+        years = Array(stride(from: last.year, through: first.year, by: -1))
+    }
+
+    /// The months of one year that fall inside the library's date range.
+    func months(in year: Int) -> [MonthKey] {
+        guard let oldest, let newest else { return [] }
+        return (1...12).map { MonthKey(year: year, month: $0) }.filter { $0 >= oldest && $0 <= newest }
+    }
+
+    /// Counts one month. Cheap, and only called for tiles that are visible.
+    func loadSummary(_ key: MonthKey) async {
+        guard driveConnected, summaries[key] == nil, !emptyMonths.contains(key), !loading.contains(key) else { return }
+        loading.insert(key)
+        defer { loading.remove(key) }
+        if let s = await Task.detached(priority: .userInitiated, operation: { MediaFilter.summary(for: key) }).value {
+            summaries[key] = s
+        } else {
+            emptyMonths.insert(key)
         }
-        months = found
+    }
+
+    /// Forget a month's count so it's recounted (after deleting from it).
+    func invalidate(_ key: MonthKey) {
+        summaries[key] = nil
+        emptyMonths.remove(key)
     }
 
     private static func map(_ s: PHAuthorizationStatus) -> Access {
