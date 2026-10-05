@@ -4,3 +4,4 @@ DerivedData/
 build/
 *.xcuserstate
 Shoebox.zip
+*.xcodeproj/project.xcworkspace/
