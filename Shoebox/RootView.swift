@@ -25,8 +25,8 @@ struct RootView: View {
             case .granted:
                 if let session {
                     ReviewView(session: session) { deleted in
+                        if deleted { library.invalidate(session.month) }
                         self.session = nil
-                        if deleted { Task { await library.buildIndex() } }
                     }
                     .transition(.opacity)
                 } else {
@@ -40,7 +40,7 @@ struct RootView: View {
             }
         }
         .task {
-            if library.access == .granted && library.months.isEmpty { await library.buildIndex() }
+            if library.access == .granted && library.years.isEmpty { await library.loadRange() }
         }
     }
 }

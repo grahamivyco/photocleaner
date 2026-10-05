@@ -6,37 +6,35 @@ struct MonthListView: View {
     @Environment(ProgressStore.self) private var store
     let onOpen: (MonthKey) -> Void
 
-    private var years: [(year: Int, months: [MonthSummary])] {
-        Dictionary(grouping: library.months, by: \.key.year)
-            .map { ($0.key, $0.value.sorted { $0.key < $1.key }) }
-            .sorted { $0.0 > $1.0 }
+    @AppStorage("selectedYear") private var savedYear = 0
+
+    private var year: Int? {
+        library.years.contains(savedYear) ? savedYear : library.years.first
     }
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 28) {
+            VStack(alignment: .leading, spacing: 24) {
                 header
                 if !library.driveConnected { DriveBanner() }
-                if library.isIndexing {
+                if library.isIndexing && library.years.isEmpty {
                     HStack(spacing: 10) {
                         ProgressView().controlSize(.small)
-                        Text("Counting your library… \(library.indexingMonth?.title ?? "")")
-                            .foregroundStyle(Theme.muted)
-                            .monospacedDigit()
+                        Text("Opening your library…").foregroundStyle(Theme.muted)
                     }
-                    .padding(.top, library.months.isEmpty ? 40 : 0)
+                    .padding(.top, 40)
                     .frame(maxWidth: .infinity)
                 }
-                ForEach(years, id: \.year) { group in
-                    VStack(alignment: .leading, spacing: 12) {
-                        Text(String(group.year))
-                            .font(Theme.display(26))
-                            .foregroundStyle(Theme.ink)
-                        LazyVGrid(columns: [GridItem(.adaptive(minimum: 168, maximum: 240), spacing: 14)], spacing: 14) {
-                            ForEach(group.months) { m in
-                                MonthTile(summary: m, progress: store.progress(for: m.key)) { onOpen(m.key) }
-                                    .disabled(!library.driveConnected)
-                            }
+                if let year {
+                    yearPicker(selected: year)
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 168, maximum: 240), spacing: 14)], spacing: 14) {
+                        ForEach(library.months(in: year)) { key in
+                            MonthTile(key: key,
+                                      summary: library.summaries[key],
+                                      isEmpty: library.emptyMonths.contains(key),
+                                      progress: store.progress(for: key)) { onOpen(key) }
+                                .disabled(!library.driveConnected || library.emptyMonths.contains(key))
+                                .task(id: key) { await library.loadSummary(key) }
                         }
                     }
                 }
@@ -48,11 +46,24 @@ struct MonthListView: View {
         .scrollIndicators(.hidden)
     }
 
+    private func yearPicker(selected: Int) -> some View {
+        ScrollView(.horizontal) {
+            HStack(spacing: 8) {
+                ForEach(library.years, id: \.self) { y in
+                    Button { savedYear = y } label: { Text(String(y)) }
+                        .buttonStyle(PillButtonStyle(fill: y == selected ? Theme.amber : Theme.surface,
+                                                     text: y == selected ? Theme.bg : Theme.ink))
+                }
+            }
+        }
+        .scrollIndicators(.hidden)
+    }
+
     private var header: some View {
         HStack(alignment: .lastTextBaseline) {
             VStack(alignment: .leading, spacing: 4) {
                 Text("Shoebox").font(Theme.display(44, weight: .bold)).foregroundStyle(Theme.ink)
-                Text("Pick a month. → keeps, ← tosses. Nothing is deleted until you confirm.")
+                Text("Pick a year, then a month. → keeps, ← tosses. Nothing is deleted until you confirm.")
                     .font(.system(size: 14))
                     .foregroundStyle(Theme.muted)
             }
@@ -96,7 +107,9 @@ private struct CoverImage: View {
 }
 
 private struct MonthTile: View {
-    let summary: MonthSummary
+    let key: MonthKey
+    let summary: MonthSummary?
+    let isEmpty: Bool
     let progress: MonthProgress
     let action: () -> Void
     @State private var hovering = false
@@ -113,10 +126,10 @@ private struct MonthTile: View {
                     .clipped()
                     .overlay(alignment: .topTrailing) { badge.padding(8) }
                     .saturation(finished ? 0.15 : 1)
-                    .opacity(finished ? 0.6 : 1)
+                    .opacity(finished || isEmpty ? 0.6 : 1)
 
                 VStack(alignment: .leading, spacing: 4) {
-                    Text(summary.key.monthName)
+                    Text(key.monthName)
                         .font(Theme.display(17))
                         .foregroundStyle(Theme.ink)
                     Text(detail)
@@ -124,7 +137,7 @@ private struct MonthTile: View {
                         .foregroundStyle(Theme.muted)
                         .lineLimit(1)
                     if inProgress {
-                        ProgressView(value: Double(progress.decisions.count), total: Double(max(summary.total, 1)))
+                        ProgressView(value: Double(progress.decisions.count), total: Double(max(summary?.total ?? 1, 1)))
                             .progressViewStyle(.linear)
                             .tint(Theme.amber)
                             .padding(.top, 2)
@@ -136,7 +149,7 @@ private struct MonthTile: View {
             .background(Theme.surface)
             .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
             .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(hovering ? Theme.amber.opacity(0.7) : Theme.line, lineWidth: 1))
+                .stroke(hovering && !isEmpty ? Theme.amber.opacity(0.7) : Theme.line, lineWidth: 1))
             .scaleEffect(hovering ? 1.015 : 1)
             .animation(.easeOut(duration: 0.12), value: hovering)
         }
@@ -145,7 +158,7 @@ private struct MonthTile: View {
     }
 
     private var cover: some View {
-        CoverImage(id: summary.coverID)
+        CoverImage(id: summary?.coverID)
     }
 
     @ViewBuilder private var badge: some View {
@@ -156,7 +169,7 @@ private struct MonthTile: View {
                 .padding(6)
                 .background(Circle().fill(Theme.keep))
         } else if inProgress {
-            Text("\(Int(Double(progress.decisions.count) / Double(max(summary.total, 1)) * 100))%")
+            Text("\(Int(Double(progress.decisions.count) / Double(max(summary?.total ?? 1, 1)) * 100))%")
                 .font(Theme.label(10, weight: .bold))
                 .foregroundStyle(Theme.bg)
                 .padding(.horizontal, 7).padding(.vertical, 3)
@@ -168,6 +181,8 @@ private struct MonthTile: View {
         if finished {
             return progress.freedBytes > 0 ? "Done · freed \(Format.bytes(progress.freedBytes))" : "Done"
         }
+        if isEmpty { return "Nothing here" }
+        guard let summary else { return "Counting…" }
         var parts = ["\(summary.photos) photo\(summary.photos == 1 ? "" : "s")"]
         if summary.videos > 0 { parts.append("\(summary.videos) video\(summary.videos == 1 ? "" : "s")") }
         return parts.joined(separator: " · ")
