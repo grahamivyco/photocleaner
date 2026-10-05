@@ -9,11 +9,10 @@ enum Config {
     /// How far a two-finger trackpad swipe must travel (in points) to count.
     static let swipeThreshold: CGFloat = 120
 
-    /// How long to wait on Photos before offering Retry.
-    static let photosTimeoutSeconds = 30
-    static var photosTimeout: Duration { .seconds(photosTimeoutSeconds) }
+    /// After this many seconds without an answer, explain that Photos is busy.
+    static let slowPhotosSeconds = 20
 
-    /// Years listed before Photos reports the real range.
+    /// Oldest year in the year picker.
     static let earliestGuessYear = 2000
 
     /// Pixel size requested for the full-screen preview.

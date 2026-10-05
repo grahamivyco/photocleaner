@@ -83,19 +83,24 @@ private struct LibraryStatus: View {
                 case .working(let what):
                     ProgressView().controlSize(.small)
                     TimelineView(.periodic(from: .now, by: 1)) { ctx in
-                        Text("\(what)… \(max(0, Int(ctx.date.timeIntervalSince(library.phaseStarted))))s")
+                        let secs = max(0, Int(ctx.date.timeIntervalSince(library.phaseStarted)))
+                        Text(secs >= Config.slowPhotosSeconds
+                             ? "\(what)… \(secs)s. Photos is busy, probably syncing. You can open a month anyway."
+                             : "\(what)… \(secs)s")
                             .monospacedDigit()
                     }
                 case .ready:
                     Image(systemName: "checkmark.circle.fill").foregroundStyle(Theme.keep)
                     Text("Up to date")
-                case .notResponding:
-                    Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(Theme.toss)
-                    Text("Photos isn't responding")
                 case .idle:
                     EmptyView()
                 }
                 Spacer()
+                if !library.requireDrive {
+                    Button("Using System Photo Library · Require drive again") { library.requireDrive = true }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(Theme.muted)
+                }
                 if library.monthsCounted > 0 {
                     Text("\(library.itemsCounted.formatted()) items counted in \(library.monthsCounted) month\(library.monthsCounted == 1 ? "" : "s")")
                         .monospacedDigit()
@@ -104,21 +109,6 @@ private struct LibraryStatus: View {
             .font(Theme.label(12))
             .foregroundStyle(Theme.muted)
 
-            if case .notResponding(let detail) = library.phase {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text(detail).foregroundStyle(Theme.ink)
-                    Text("Photos may be syncing with iCloud or busy reading the USB drive. Open the Photos app and check it shows your library with no messages, then click Retry. Retry waits another \(Config.photosTimeoutSeconds) seconds for the same lookup.")
-                        .foregroundStyle(Theme.muted)
-                    Button("Retry") { library.retry() }
-                        .buttonStyle(PillButtonStyle(fill: Theme.amber, text: Theme.bg))
-                        .padding(.top, 2)
-                }
-                .font(.system(size: 13))
-                .padding(14)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(RoundedRectangle(cornerRadius: 10).fill(Theme.toss.opacity(0.14)))
-                .overlay(RoundedRectangle(cornerRadius: 10).stroke(Theme.toss.opacity(0.45)))
-            }
         }
     }
 }
