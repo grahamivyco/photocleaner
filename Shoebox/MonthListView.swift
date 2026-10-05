@@ -20,6 +20,7 @@ struct MonthListView: View {
                 LibraryStatus()
                 if let year {
                     yearPicker(selected: year)
+                    YearProgress(months: library.months(in: year), year: year)
                     LazyVGrid(columns: [GridItem(.adaptive(minimum: 168, maximum: 240), spacing: 14)], spacing: 14) {
                         ForEach(library.months(in: year)) { key in
                             MonthTile(key: key,
@@ -68,6 +69,28 @@ struct MonthListView: View {
                 Stat(value: Format.bytes(store.totalFreed), label: "freed", accent: true)
             }
         }
+    }
+}
+
+/// "3 of 10 months counted · 1,234 items" for the year on screen.
+private struct YearProgress: View {
+    @Environment(PhotoLibrary.self) private var library
+    let months: [MonthKey]
+    let year: Int
+
+    var body: some View {
+        let done = months.filter { library.isCounted($0) }
+        let items = done.reduce(0) { $0 + (library.summaries[$1]?.total ?? 0) }
+        HStack(spacing: 12) {
+            ProgressView(value: Double(done.count), total: Double(max(months.count, 1)))
+                .progressViewStyle(.linear)
+                .tint(Theme.amber)
+                .frame(width: 180)
+            Text("\(String(year)): \(done.count) of \(months.count) months counted · \(items.formatted()) items so far")
+                .monospacedDigit()
+        }
+        .font(Theme.label(12))
+        .foregroundStyle(Theme.muted)
     }
 }
 
