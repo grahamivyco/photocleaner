@@ -80,7 +80,7 @@ struct ReviewView: View {
     private func preheat() {
         let n = session.assets.count
         let start = min(session.index + 1, n)
-        let next = Array(session.assets[start..<min(start + 3, n)])
+        let next = Array(session.assets[start..<min(start + 6, n)])
         MediaLoader.stopPreheat(preheated.filter { !next.contains($0) })
         MediaLoader.preheat(next)
         preheated = next
@@ -202,8 +202,8 @@ struct ReviewView: View {
                 Dot()
                 Text(kind(of: asset))
                 Dot()
-                Text(Format.bytes(session.size(of: asset)))
-                if let name = session.filename(of: asset) {
+                Text(session.info[asset.localIdentifier].map { Format.bytes($0.size) } ?? "…")
+                if let name = session.info[asset.localIdentifier]?.filename {
                     Dot()
                     Text(name).lineLimit(1).truncationMode(.middle)
                 }
