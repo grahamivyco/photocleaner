@@ -86,8 +86,8 @@ enum MediaFilter {
                             coverID: all.firstObject?.localIdentifier)
     }
 
-    /// Oldest and newest dated items in the library.
-    static func dateRange() -> (oldest: Date, newest: Date)? {
+    /// Oldest and newest dated items. Two indexed lookups, no items loaded.
+    static func dateRange() -> LibraryRange {
         func edge(ascending: Bool) -> Date? {
             let opts = PHFetchOptions()
             opts.predicate = mediaPredicate
@@ -95,100 +95,126 @@ enum MediaFilter {
             opts.fetchLimit = 1
             return PHAsset.fetchAssets(with: opts).firstObject?.creationDate
         }
-        guard let oldest = edge(ascending: true), let newest = edge(ascending: false) else { return nil }
-        return (oldest, newest)
+        return LibraryRange(oldest: edge(ascending: true), newest: edge(ascending: false))
     }
+}
+
+struct LibraryRange: Sendable {
+    let oldest: Date?
+    let newest: Date?
 }
 
 @MainActor @Observable
 final class PhotoLibrary {
-    enum Access { case unknown, granted, denied }
+    enum Access: Equatable {
+        case notDetermined, requesting, authorized, limited, denied, restricted
+    }
 
-    var access: Access = .unknown
+    enum Phase: Equatable {
+        case idle
+        case working(String)
+        case notResponding(String)
+        case ready
+    }
+
+    var access: Access = .notDetermined
     var driveConnected = false
-    /// Years that contain items, newest first. Found with two quick lookups.
-    var years: [Int] = []
-    var oldest: MonthKey?
-    var newest: MonthKey?
-    var isIndexing = false
-    /// Set when Photos takes unusually long to answer the first lookup.
-    var isSlow = false
-    /// Counts are loaded one month at a time, only for months on screen.
+    var phase: Phase = .idle
+    /// When the current Photos lookup started, for the elapsed-time readout.
+    var phaseStarted = Date()
+
+    /// Shown straight away from the calendar, then trimmed to the library's
+    /// real range once Photos answers.
+    var years: [Int] = Array(stride(from: Calendar.current.component(.year, from: Date()),
+                                    through: Config.earliestGuessYear, by: -1))
+    private(set) var oldest: MonthKey?
+    private(set) var newest: MonthKey?
+    private(set) var rangeKnown = false
+
     var summaries: [MonthKey: MonthSummary] = [:]
     var emptyMonths: Set<MonthKey> = []
-    private var loading: Set<MonthKey> = []
+    var itemsCounted: Int { summaries.values.reduce(0) { $0 + $1.total } }
+    var monthsCounted: Int { summaries.count + emptyMonths.count }
+
+    /// Months waiting to be counted. The front is counted next.
+    private var queue: [MonthKey] = []
+    private var worker: Task<Void, Never>?
+    // PhotoKit calls can't be cancelled, so a lookup that times out is kept
+    // and waited on again by Retry instead of being started twice.
+    private var rangeTask: Task<LibraryRange, Never>?
+    private var summaryTasks: [MonthKey: Task<MonthSummary?, Never>] = [:]
     private var observers: [NSObjectProtocol] = []
+
+    var isAuthorized: Bool { access == .authorized || access == .limited }
+    private var canQuery: Bool { isAuthorized && driveConnected }
 
     init() {
         access = Self.map(PHPhotoLibrary.authorizationStatus(for: .readWrite))
-        refreshDrive()
-        let nc = NSWorkspace.shared.notificationCenter
+        driveConnected = FileManager.default.fileExists(atPath: Config.libraryPath)
+        let ws = NSWorkspace.shared.notificationCenter
         for name in [NSWorkspace.didMountNotification, NSWorkspace.didUnmountNotification] {
-            observers.append(nc.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+            observers.append(ws.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
                 MainActor.assumeIsolated { self?.refreshDrive() }
             })
         }
+        // Picks up a change made in System Settings while Shoebox was in the background.
+        observers.append(NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification,
+                                                                object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.refreshAccess() }
+        })
     }
 
-    func refreshDrive() {
-        let connected = FileManager.default.fileExists(atPath: Config.libraryPath)
-        let wasConnected = driveConnected
-        driveConnected = connected
-        if connected && !wasConnected && access == .granted && years.isEmpty {
-            Task { await loadRange() }
-        }
+    // MARK: Access and drive
+
+    func refreshAccess() {
+        guard access != .requesting else { return }
+        access = Self.map(PHPhotoLibrary.authorizationStatus(for: .readWrite))
+        pump()
     }
 
     func requestAccess() async {
+        access = .requesting
         let status = await PHPhotoLibrary.requestAuthorization(for: .readWrite)
         access = Self.map(status)
-        if access == .granted { await loadRange() }
+        pump()
     }
 
-    /// Finds the oldest and newest items so the year picker knows its range.
-    func loadRange() async {
-        guard access == .granted, driveConnected, !isIndexing else { return }
-        isIndexing = true
-        isSlow = false
-        let started = Date()
-        NSLog("Shoebox: asking Photos for date range")
-        let watchdog = Task {
-            try? await Task.sleep(for: .seconds(15))
-            if !Task.isCancelled { isSlow = true }
-        }
-        defer {
-            watchdog.cancel()
-            isIndexing = false
-            isSlow = false
-            NSLog("Shoebox: date range took %.1fs", Date().timeIntervalSince(started))
-        }
-        guard let range = await Task.detached(priority: .userInitiated, operation: { MediaFilter.dateRange() }).value else {
-            years = []
-            return
-        }
-        let first = MonthKey(range.oldest)
-        let last = MonthKey(range.newest)
-        oldest = first
-        newest = last
-        years = Array(stride(from: last.year, through: first.year, by: -1))
+    func refreshDrive() {
+        driveConnected = FileManager.default.fileExists(atPath: Config.libraryPath)
+        if !driveConnected && phase != .ready { phase = .idle }
+        pump()
     }
 
-    /// The months of one year that fall inside the library's date range.
+    // MARK: Loading
+
+    /// Starts (or resumes) loading. Safe to call any time.
+    func start() { pump() }
+
+    /// After a timeout: wait another 30 seconds on the same lookup.
+    func retry() {
+        if case .notResponding = phase { phase = .idle }
+        pump()
+    }
+
+    /// The months of one year to show. Before Photos answers, every month up to today.
     func months(in year: Int) -> [MonthKey] {
-        guard let oldest, let newest else { return [] }
-        return (1...12).map { MonthKey(year: year, month: $0) }.filter { $0 >= oldest && $0 <= newest }
+        let all = (1...12).map { MonthKey(year: year, month: $0) }
+        if let oldest, let newest { return all.filter { $0 >= oldest && $0 <= newest } }
+        let now = MonthKey(Date())
+        return all.filter { $0 <= now }
     }
 
-    /// Counts one month. Cheap, and only called for tiles that are visible.
-    func loadSummary(_ key: MonthKey) async {
-        guard driveConnected, summaries[key] == nil, !emptyMonths.contains(key), !loading.contains(key) else { return }
-        loading.insert(key)
-        defer { loading.remove(key) }
-        if let s = await Task.detached(priority: .userInitiated, operation: { MediaFilter.summary(for: key) }).value {
-            summaries[key] = s
-        } else {
-            emptyMonths.insert(key)
-        }
+    /// Asks for a month's count. Called when its tile appears; newest requests go first.
+    func requestSummary(_ key: MonthKey) {
+        guard summaries[key] == nil, !emptyMonths.contains(key) else { return }
+        queue.removeAll { $0 == key }
+        queue.insert(key, at: 0)
+        pump()
+    }
+
+    func isCounting(_ key: MonthKey) -> Bool {
+        if case .working = phase { return queue.first == key && rangeKnown }
+        return false
     }
 
     /// Forget a month's count so it's recounted (after deleting from it).
@@ -197,11 +223,107 @@ final class PhotoLibrary {
         emptyMonths.remove(key)
     }
 
+    private func pump() {
+        guard worker == nil, canQuery else { return }
+        if case .notResponding = phase { return }
+        worker = Task {
+            await runQueue()
+            worker = nil
+        }
+    }
+
+    /// One Photos lookup at a time: the date range first, then month counts.
+    private func runQueue() async {
+        if !rangeKnown {
+            guard await loadRange() else { return }
+        }
+        while let key = queue.first {
+            guard canQuery else { return }
+            begin(.working("Counting \(key.title)"))
+            let task = summaryTasks[key] ?? Task.detached(priority: .userInitiated) { MediaFilter.summary(for: key) }
+            summaryTasks[key] = task
+            guard let result = await Waiter.value(of: task, timeout: Config.photosTimeout) else {
+                phase = .notResponding("Photos didn't answer within \(Config.photosTimeoutSeconds) seconds while counting \(key.title).")
+                NSLog("Shoebox: timed out counting %@", key.id)
+                return
+            }
+            summaryTasks[key] = nil
+            queue.removeAll { $0 == key }
+            if let s = result { summaries[key] = s } else { emptyMonths.insert(key) }
+        }
+        phase = .ready
+    }
+
+    private func loadRange() async -> Bool {
+        begin(.working("Finding your oldest and newest photos"))
+        let task = rangeTask ?? Task.detached(priority: .userInitiated) { MediaFilter.dateRange() }
+        rangeTask = task
+        guard let range = await Waiter.value(of: task, timeout: Config.photosTimeout) else {
+            phase = .notResponding("Photos didn't answer within \(Config.photosTimeoutSeconds) seconds while opening your library.")
+            NSLog("Shoebox: timed out finding date range")
+            return false
+        }
+        rangeTask = nil
+        NSLog("Shoebox: date range took %.1fs", Date().timeIntervalSince(phaseStarted))
+        rangeKnown = true
+        if let first = range.oldest, let last = range.newest {
+            oldest = MonthKey(first)
+            newest = MonthKey(last)
+            years = Array(stride(from: newest!.year, through: oldest!.year, by: -1))
+        } else {
+            years = []
+        }
+        // Drop queued months outside the real range.
+        queue.removeAll { !months(in: $0.year).contains($0) }
+        return true
+    }
+
+    private func begin(_ p: Phase) {
+        if p != phase { phaseStarted = Date() }
+        phase = p
+    }
+
     private static func map(_ s: PHAuthorizationStatus) -> Access {
         switch s {
-        case .authorized, .limited: return .granted
-        case .notDetermined: return .unknown
-        default: return .denied
+        case .authorized: return .authorized
+        case .limited: return .limited
+        case .denied: return .denied
+        case .restricted: return .restricted
+        case .notDetermined: return .notDetermined
+        @unknown default: return .denied
         }
+    }
+}
+
+/// Waits for a background task but stops waiting after `timeout`.
+/// The task keeps running, so waiting on it again later still gets its result.
+enum Waiter {
+    static func value<T: Sendable>(of task: Task<T, Never>, timeout: Duration) async -> T? {
+        await withCheckedContinuation { (cont: CheckedContinuation<T?, Never>) in
+            let once = ResumeOnce(cont)
+            Task {
+                let v = await task.value
+                once.resume(v)
+            }
+            Task {
+                try? await Task.sleep(for: timeout)
+                once.resume(nil)
+            }
+        }
+    }
+}
+
+private final class ResumeOnce<T>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cont: CheckedContinuation<T?, Never>?
+
+    init(_ cont: CheckedContinuation<T?, Never>) { self.cont = cont }
+
+    func resume(_ value: T?) {
+        lock.lock()
+        let c = cont
+        cont = nil
+        lock.unlock()
+        c?.resume(returning: value)
     }
 }
