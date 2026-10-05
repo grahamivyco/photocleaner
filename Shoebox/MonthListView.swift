@@ -17,12 +17,14 @@ struct MonthListView: View {
             VStack(alignment: .leading, spacing: 28) {
                 header
                 if !library.driveConnected { DriveBanner() }
-                if library.isIndexing && library.months.isEmpty {
+                if library.isIndexing {
                     HStack(spacing: 10) {
                         ProgressView().controlSize(.small)
-                        Text("Counting your library…").foregroundStyle(Theme.muted)
+                        Text("Counting your library… \(library.indexingMonth?.title ?? "")")
+                            .foregroundStyle(Theme.muted)
+                            .monospacedDigit()
                     }
-                    .padding(.top, 40)
+                    .padding(.top, library.months.isEmpty ? 40 : 0)
                     .frame(maxWidth: .infinity)
                 }
                 ForEach(years, id: \.year) { group in
